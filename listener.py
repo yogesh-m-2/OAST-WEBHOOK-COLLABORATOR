@@ -102,9 +102,9 @@ def _save_rules():
 
 def _hit_matches(hit, rtype, value):
     """Does an already-stored hit match a newly added rule? Used to retroactively
-    hide existing noise when you mute it."""
+    hide existing noise when you mute it. Supports wildcard/CIDR for src_ip."""
     if rtype == "src_ip":
-        return hit.get("ip") == value
+        return _ip_matches(hit.get("ip", ""), value)
     if rtype == "kind":
         return hit.get("kind") == value
     if rtype == "dst_port":
@@ -113,13 +113,46 @@ def _hit_matches(hit, rtype, value):
     return False
 
 
+def _ip_matches(ip, pattern):
+    """Match an IP against a rule pattern. Supports:
+       exact     85.217.140.4
+       wildcard  85.217.140.*  /  85.217.*  /  85.*
+       CIDR      85.217.0.0/16
+    """
+    if not ip:
+        return False
+    if pattern == ip:
+        return True
+    # CIDR
+    if "/" in pattern:
+        try:
+            net, bits = pattern.split("/")
+            bits = int(bits)
+            def _to_int(a):
+                parts = [int(x) for x in a.split(".")]
+                return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+            mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+            return (_to_int(ip) & mask) == (_to_int(net) & mask)
+        except Exception:
+            return False
+    # wildcard with trailing * on octet boundaries: 85.*  85.217.*  85.217.140.*
+    if pattern.endswith("*"):
+        prefix = pattern[:-1]              # "85.217.140."  or "85.217."  or "85."
+        if prefix.endswith("."):
+            return ip.startswith(prefix)
+        # also allow "85.217.140.*" matching without requiring user to add the dot
+        return ip.startswith(prefix)
+    return False
+
+
 def _muted_by_rules(kind, src, dst):
     """True if this packet matches a live mute rule (src IP / dst port / kind)."""
     src_ip = src.split(":")[0] if src else ""
     dst_port = dst.split(":")[1] if dst and ":" in dst else ""
     with _rules_lock:
-        if src_ip and src_ip in _rules["src_ips"]:
-            return True
+        for pat in _rules["src_ips"]:
+            if _ip_matches(src_ip, pat):
+                return True
         if dst_port and dst_port.isdigit() and int(dst_port) in _rules["dst_ports"]:
             return True
         if kind and kind in _rules["kinds"]:
