@@ -37,8 +37,94 @@ MAX_STORED = int(os.environ.get("OAST_MAX_STORED", "500"))
 
 ALLOWED_BIND_HOSTS = {"0.0.0.0", "127.0.0.1", CAPTURE_HOST}
 
+# ─── Sniffer noise filter ────────────────────────────────────────────────────
+# Most-aggressive policy: only KEEP IPv4 packets whose destination is THIS VPS
+# (an OAST callback always arrives AT us). Everything else is dropped early:
+#   - non-IPv4 (ARP, EtherType 0x0027 link chatter, IPv6 0x86dd)
+#   - our own outbound traffic, provider chatter (85.217.x), broadcast/multicast
+#   - SSH (port 22) admin traffic
+#   - our own API port (anti-spiral)
+# Override the kept IP with OAST_KEEP_DST_IP if your public IP differs.
+KEEP_DST_IP = os.environ.get("OAST_KEEP_DST_IP", CAPTURE_HOST)
+DROP_PORTS = {22, API_PORT}   # SSH + our own API
+# extra dst ports to drop, comma-separated, e.g. OAST_DROP_PORTS="123,161"
+_extra = os.environ.get("OAST_DROP_PORTS", "")
+for _p in _extra.split(","):
+    _p = _p.strip()
+    if _p.isdigit():
+        DROP_PORTS.add(int(_p))
+
 _hits = []
 _lock = threading.Lock()
+
+# ─── Live mute rules (persisted, editable from the frontend) ─────────────────
+# Stored in filter_rules.json next to this file. Three rule types you can add by
+# clicking a packet in the dashboard: source IP, destination port, protocol kind.
+RULES_FILE = os.environ.get("OAST_RULES_FILE",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "filter_rules.json"))
+_rules = {"src_ips": [], "dst_ports": [], "kinds": []}
+_rules_lock = threading.Lock()
+
+
+def _load_rules():
+    global _rules
+    try:
+        with open(RULES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with _rules_lock:
+            _rules = {
+                "src_ips": list(data.get("src_ips", [])),
+                "dst_ports": [int(p) for p in data.get("dst_ports", [])],
+                "kinds": list(data.get("kinds", [])),
+            }
+        print(f"[*] loaded mute rules: {len(_rules['src_ips'])} IPs, "
+              f"{len(_rules['dst_ports'])} ports, {len(_rules['kinds'])} kinds")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[!] could not load rules: {e}")
+
+
+def _save_rules():
+    try:
+        with _rules_lock:
+            snapshot = {
+                "src_ips": sorted(set(_rules["src_ips"])),
+                "dst_ports": sorted(set(_rules["dst_ports"])),
+                "kinds": sorted(set(_rules["kinds"])),
+            }
+        with open(RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+    except Exception as e:
+        print(f"[!] could not save rules: {e}")
+
+
+def _hit_matches(hit, rtype, value):
+    """Does an already-stored hit match a newly added rule? Used to retroactively
+    hide existing noise when you mute it."""
+    if rtype == "src_ip":
+        return hit.get("ip") == value
+    if rtype == "kind":
+        return hit.get("kind") == value
+    if rtype == "dst_port":
+        dst = hit.get("dst", "")
+        return dst.endswith(f":{value}")
+    return False
+
+
+def _muted_by_rules(kind, src, dst):
+    """True if this packet matches a live mute rule (src IP / dst port / kind)."""
+    src_ip = src.split(":")[0] if src else ""
+    dst_port = dst.split(":")[1] if dst and ":" in dst else ""
+    with _rules_lock:
+        if src_ip and src_ip in _rules["src_ips"]:
+            return True
+        if dst_port and dst_port.isdigit() and int(dst_port) in _rules["dst_ports"]:
+            return True
+        if kind and kind in _rules["kinds"]:
+            return True
+    return False
 
 
 def _record(source_ip, source_port, raw, kind="tcp-capture", extra=None):
@@ -214,6 +300,13 @@ class _API(BaseHTTPRequestHandler):
                 "allowed_hosts": sorted(ALLOWED_BIND_HOSTS),
                 "last_error": controller.last_error,
             })
+        elif self.path == "/rules":
+            with _rules_lock:
+                self._send({
+                    "src_ips": sorted(set(_rules["src_ips"])),
+                    "dst_ports": sorted(set(_rules["dst_ports"])),
+                    "kinds": sorted(set(_rules["kinds"])),
+                })
         else:
             self._send({"error": "not found"}, 404)
 
@@ -231,6 +324,40 @@ class _API(BaseHTTPRequestHandler):
                 for h in _hits:
                     h["cleared"] = True
             self._send({"ok": True})
+        elif self.path in ("/rules-add", "/rules-remove"):
+            data = self._read_json()
+            rtype = str(data.get("type", "")).strip()   # src_ip | dst_port | kind
+            value = data.get("value")
+            key = {"src_ip": "src_ips", "dst_port": "dst_ports", "kind": "kinds"}.get(rtype)
+            if not key or value in (None, ""):
+                self._send({"ok": False, "error": "need type (src_ip|dst_port|kind) and value"}, 400)
+                return
+            if rtype == "dst_port":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    self._send({"ok": False, "error": "dst_port must be a number"}, 400)
+                    return
+            with _rules_lock:
+                lst = _rules[key]
+                if self.path == "/rules-add":
+                    if value not in lst:
+                        lst.append(value)
+                else:
+                    if value in lst:
+                        lst.remove(value)
+            _save_rules()
+            # also retroactively hide already-captured matching hits on add
+            if self.path == "/rules-add":
+                with _lock:
+                    for h in _hits:
+                        if _hit_matches(h, rtype, value):
+                            h["cleared"] = True
+            with _rules_lock:
+                self._send({"ok": True,
+                            "src_ips": sorted(set(_rules["src_ips"])),
+                            "dst_ports": sorted(set(_rules["dst_ports"])),
+                            "kinds": sorted(set(_rules["kinds"]))})
         elif self.path == "/config":
             data = self._read_json()
             host = str(data.get("host", controller.host)).strip()
@@ -271,46 +398,55 @@ def _hexdump(data, limit=256):
 
 
 def _decode_packet(frame):
-    """Decode an Ethernet frame enough to summarize proto + endpoints. Returns
-    (kind, src, dst, summary_text) or None to skip."""
+    """Decode an Ethernet frame. Returns (kind, src, dst, summary) or None to
+    DROP. Most-aggressive filter: keep only IPv4 packets whose destination is
+    our VPS, excluding SSH and our own API port."""
     if len(frame) < 14:
         return None
     eth_type = (frame[12] << 8) | frame[13]
     payload = frame[14:]
 
-    if eth_type == 0x0806:  # ARP
-        return ("arp", "", "", "ARP packet\n\n" + _hexdump(frame))
+    # DROP everything that isn't IPv4 (ARP, 0x0027 link chatter, IPv6, etc.)
+    if eth_type != 0x0800 or len(payload) < 20:
+        return None
 
-    if eth_type == 0x0800 and len(payload) >= 20:  # IPv4
-        ihl = (payload[0] & 0x0F) * 4
-        proto = payload[9]
-        src = ".".join(str(b) for b in payload[12:16])
-        dst = ".".join(str(b) for b in payload[16:20])
-        l4 = payload[ihl:]
-        if proto == 6 and len(l4) >= 20:   # TCP
-            sport = (l4[0] << 8) | l4[1]
-            dport = (l4[2] << 8) | l4[3]
-            doff = (l4[12] >> 4) * 4
-            body = l4[doff:]
-            head = f"TCP {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes payload)"
-            txt = head + "\n\n" + (body.decode("utf-8", "replace") if body else "(no payload)") \
-                  + "\n\n--- hex ---\n" + _hexdump(l4)
-            return ("tcp", f"{src}:{sport}", f"{dst}:{dport}", txt)
-        if proto == 17 and len(l4) >= 8:   # UDP
-            sport = (l4[0] << 8) | l4[1]
-            dport = (l4[2] << 8) | l4[3]
-            body = l4[8:]
-            label = "UDP"
-            if dport == 53 or sport == 53:
-                label = "UDP/DNS"
-            head = f"{label} {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes)"
-            txt = head + "\n\n--- hex ---\n" + _hexdump(body)
-            return ("dns" if "DNS" in label else "udp", f"{src}:{sport}", f"{dst}:{dport}", txt)
-        if proto == 1:                     # ICMP
-            return ("icmp", src, dst, f"ICMP {src} -> {dst}\n\n" + _hexdump(l4))
-        return ("ip", src, dst, f"IP proto {proto} {src} -> {dst}\n\n" + _hexdump(payload))
+    ihl = (payload[0] & 0x0F) * 4
+    proto = payload[9]
+    src = ".".join(str(b) for b in payload[12:16])
+    dst = ".".join(str(b) for b in payload[16:20])
 
-    return ("eth", "", "", f"Ethernet type 0x{eth_type:04x}\n\n" + _hexdump(frame))
+    # DROP unless this packet is arriving AT our VPS. Kills all our outbound,
+    # provider chatter, broadcast and multicast in one check.
+    if dst != KEEP_DST_IP:
+        return None
+
+    l4 = payload[ihl:]
+    if proto == 6 and len(l4) >= 20:   # TCP
+        sport = (l4[0] << 8) | l4[1]
+        dport = (l4[2] << 8) | l4[3]
+        if dport in DROP_PORTS:        # SSH / our API
+            return None
+        doff = (l4[12] >> 4) * 4
+        body = l4[doff:]
+        head = f"TCP {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes payload)"
+        txt = head + "\n\n" + (body.decode("utf-8", "replace") if body else "(no payload)") \
+              + "\n\n--- hex ---\n" + _hexdump(l4)
+        return ("tcp", f"{src}:{sport}", f"{dst}:{dport}", txt)
+    if proto == 17 and len(l4) >= 8:   # UDP
+        sport = (l4[0] << 8) | l4[1]
+        dport = (l4[2] << 8) | l4[3]
+        if dport in DROP_PORTS:
+            return None
+        body = l4[8:]
+        label = "UDP"
+        if dport == 53 or sport == 53:
+            label = "UDP/DNS"
+        head = f"{label} {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes)"
+        txt = head + "\n\n--- hex ---\n" + _hexdump(body)
+        return ("dns" if "DNS" in label else "udp", f"{src}:{sport}", f"{dst}:{dport}", txt)
+    if proto == 1:                     # ICMP
+        return ("icmp", src, dst, f"ICMP {src} -> {dst}\n\n" + _hexdump(l4))
+    return ("ip", src, dst, f"IP proto {proto} {src} -> {dst}\n\n" + _hexdump(payload))
 
 
 def _sniffer():
@@ -335,6 +471,9 @@ def _sniffer():
         # don't capture our own API traffic (the poll loop) or we feedback-spiral
         if f":{API_PORT}" in src or f":{API_PORT}" in dst:
             continue
+        # live mute rules (added by clicking packets in the dashboard)
+        if _muted_by_rules(kind, src, dst):
+            continue
         src_ip = src.split(":")[0] if src else "?"
         src_port = src.split(":")[1] if ":" in src else "0"
         _record(src_ip, src_port, txt, kind=kind, extra={"dst": dst})
@@ -348,6 +487,7 @@ SNIFFER_ENABLED = os.environ.get("OAST_SNIFFER", "1") != "0"
 
 
 if __name__ == "__main__":
+    _load_rules()
     controller.start()
     if SNIFFER_ENABLED:
         threading.Thread(target=_sniffer, daemon=True).start()
