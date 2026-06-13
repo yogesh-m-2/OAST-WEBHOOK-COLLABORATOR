@@ -41,22 +41,25 @@ _hits = []
 _lock = threading.Lock()
 
 
-def _record(source_ip, source_port, raw):
+def _record(source_ip, source_port, raw, kind="tcp-capture", extra=None):
     entry = {
         "id": str(uuid.uuid4()),
         "ts": time.time(),
         "source": f"{source_ip}:{source_port}",
         "ip": source_ip,
-        "raw": raw.decode("utf-8", errors="replace"),
+        "raw": raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw),
         "bytes": len(raw),
-        "seen": False,
-        "cleared": False,
+        "kind": kind,
     }
+    if extra:
+        entry.update(extra)
+    entry["seen"] = False
+    entry["cleared"] = False
     with _lock:
         _hits.append(entry)
         if len(_hits) > MAX_STORED:
             del _hits[0:len(_hits) - MAX_STORED]
-    print(f"[+] hit from {entry['source']} ({entry['bytes']} bytes)")
+    print(f"[+] {kind} from {entry['source']} ({entry['bytes']} bytes)")
 
 
 def _handle_conn(conn, addr):
@@ -253,11 +256,102 @@ class _API(BaseHTTPRequestHandler):
             self._send({"error": "not found"}, 404)
 
 
+ETH_P_ALL = 0x0003
+
+
+def _hexdump(data, limit=256):
+    data = data[:limit]
+    out = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hexpart = " ".join(f"{b:02x}" for b in chunk)
+        asciipart = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append(f"{i:04x}  {hexpart:<48}  {asciipart}")
+    return "\n".join(out)
+
+
+def _decode_packet(frame):
+    """Decode an Ethernet frame enough to summarize proto + endpoints. Returns
+    (kind, src, dst, summary_text) or None to skip."""
+    if len(frame) < 14:
+        return None
+    eth_type = (frame[12] << 8) | frame[13]
+    payload = frame[14:]
+
+    if eth_type == 0x0806:  # ARP
+        return ("arp", "", "", "ARP packet\n\n" + _hexdump(frame))
+
+    if eth_type == 0x0800 and len(payload) >= 20:  # IPv4
+        ihl = (payload[0] & 0x0F) * 4
+        proto = payload[9]
+        src = ".".join(str(b) for b in payload[12:16])
+        dst = ".".join(str(b) for b in payload[16:20])
+        l4 = payload[ihl:]
+        if proto == 6 and len(l4) >= 20:   # TCP
+            sport = (l4[0] << 8) | l4[1]
+            dport = (l4[2] << 8) | l4[3]
+            doff = (l4[12] >> 4) * 4
+            body = l4[doff:]
+            head = f"TCP {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes payload)"
+            txt = head + "\n\n" + (body.decode("utf-8", "replace") if body else "(no payload)") \
+                  + "\n\n--- hex ---\n" + _hexdump(l4)
+            return ("tcp", f"{src}:{sport}", f"{dst}:{dport}", txt)
+        if proto == 17 and len(l4) >= 8:   # UDP
+            sport = (l4[0] << 8) | l4[1]
+            dport = (l4[2] << 8) | l4[3]
+            body = l4[8:]
+            label = "UDP"
+            if dport == 53 or sport == 53:
+                label = "UDP/DNS"
+            head = f"{label} {src}:{sport} -> {dst}:{dport}  ({len(body)} bytes)"
+            txt = head + "\n\n--- hex ---\n" + _hexdump(body)
+            return ("dns" if "DNS" in label else "udp", f"{src}:{sport}", f"{dst}:{dport}", txt)
+        if proto == 1:                     # ICMP
+            return ("icmp", src, dst, f"ICMP {src} -> {dst}\n\n" + _hexdump(l4))
+        return ("ip", src, dst, f"IP proto {proto} {src} -> {dst}\n\n" + _hexdump(payload))
+
+    return ("eth", "", "", f"Ethernet type 0x{eth_type:04x}\n\n" + _hexdump(frame))
+
+
+def _sniffer():
+    """Capture EVERY frame on the interface (TCP/UDP/ARP/ICMP/...) and record it.
+    Filters out our own API port so we don't sniff our own poll traffic into a loop."""
+    try:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    except (AttributeError, PermissionError, OSError) as e:
+        print(f"[!] sniffer disabled ({e}). Needs Linux + root. TCP capture on "
+              f"{CAPTURE_PORT} still works.")
+        return
+    print("[*] raw sniffer active (all ports, all protocols)")
+    while True:
+        try:
+            frame = s.recv(65535)
+        except OSError:
+            continue
+        dec = _decode_packet(frame)
+        if not dec:
+            continue
+        kind, src, dst, txt = dec
+        # don't capture our own API traffic (the poll loop) or we feedback-spiral
+        if f":{API_PORT}" in src or f":{API_PORT}" in dst:
+            continue
+        src_ip = src.split(":")[0] if src else "?"
+        src_port = src.split(":")[1] if ":" in src else "0"
+        _record(src_ip, src_port, txt, kind=kind, extra={"dst": dst})
+
+
 def _api_server():
     HTTPServer((API_HOST, API_PORT), _API).serve_forever()
 
 
+SNIFFER_ENABLED = os.environ.get("OAST_SNIFFER", "1") != "0"
+
+
 if __name__ == "__main__":
     controller.start()
+    if SNIFFER_ENABLED:
+        threading.Thread(target=_sniffer, daemon=True).start()
+    else:
+        print("[*] sniffer off (OAST_SNIFFER=0); TCP capture only")
     print(f"[*] notification API on {API_HOST}:{API_PORT} (token required)")
     _api_server()
