@@ -1,13 +1,17 @@
 """
-Lightweight OAST/raw-TCP listener for The Great Automation.
-Binds a TCP capture port (default 23.94.111.244:4444), logs raw bytes + source,
-and serves notifications + bind-config to the dashboard over a loopback API
-on 127.0.0.1:4445.
+OAST listener for The Great Automation.
 
-Run:  python3 listener.py
+What it does:
+  - Listens on 23.94.111.244:4444 for ANY TCP connection (HTTP, raw bytes, OAST
+    callbacks). Logs the raw bytes + source IP.
+  - Exposes a small JSON API on 0.0.0.0:4445 that your PyCharm dashboard POLLS
+    directly over the internet (no SSH tunnel). Protected by a shared token.
 
-Env overrides (optional; UI can change host/port at runtime too):
-  OAST_BIND, OAST_PORT, OAST_API_BIND, OAST_API_PORT, OAST_MAX_BYTES, OAST_MAX_STORED
+Run on the VPS:
+    python3 listener.py
+
+The token below must match OAST_TOKEN in the PyCharm app (oast_routes.py).
+Change it to anything you like; just keep both sides equal.
 """
 import os
 import socket
@@ -17,20 +21,21 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ─── Defaults ────────────────────────────────────────────────────────────────
-DEFAULT_BIND = os.environ.get("OAST_BIND", "23.94.111.244")
-DEFAULT_PORT = int(os.environ.get("OAST_PORT", "4444"))
+# ─── Config ──────────────────────────────────────────────────────────────────
+CAPTURE_HOST = os.environ.get("OAST_BIND", "23.94.111.244")
+CAPTURE_PORT = int(os.environ.get("OAST_PORT", "4444"))
 
-API_HOST  = os.environ.get("OAST_API_BIND", "127.0.0.1")   # loopback only
-API_PORT  = int(os.environ.get("OAST_API_PORT", "4445"))
+API_HOST = os.environ.get("OAST_API_BIND", "0.0.0.0")   # internet-reachable so PyCharm can poll
+API_PORT = int(os.environ.get("OAST_API_PORT", "4445"))
 
-MAX_BYTES  = int(os.environ.get("OAST_MAX_BYTES", "8192"))
+# Shared secret. PyCharm must send this in the X-OAST-Token header.
+# Change it to your own value; keep it identical in oast_routes.py.
+TOKEN = os.environ.get("OAST_TOKEN", "change-this-secret-7c1f9a2b")
+
+MAX_BYTES = int(os.environ.get("OAST_MAX_BYTES", "8192"))
 MAX_STORED = int(os.environ.get("OAST_MAX_STORED", "500"))
 
-# IPs we permit binding to. The box can only bind interfaces it owns; we also
-# allow 0.0.0.0 (all) and loopback. This both prevents silent bind failures and
-# keeps the runtime-config endpoint from being abused to point elsewhere.
-ALLOWED_BIND_HOSTS = {"0.0.0.0", "127.0.0.1", DEFAULT_BIND}
+ALLOWED_BIND_HOSTS = {"0.0.0.0", "127.0.0.1", CAPTURE_HOST}
 
 _hits = []
 _lock = threading.Lock()
@@ -79,7 +84,7 @@ def _handle_conn(conn, addr):
 
 
 class ListenerController:
-    """Owns the capture socket. Can rebind to a new host/port at runtime."""
+    """Owns the capture socket; can rebind to a new host/port at runtime."""
     def __init__(self, host, port):
         self.host = host
         self.port = port
@@ -94,7 +99,7 @@ class ListenerController:
             try:
                 conn, addr = sock.accept()
             except OSError:
-                break  # socket closed during rebind/shutdown
+                break
             threading.Thread(target=_handle_conn, args=(conn, addr),
                              daemon=True).start()
 
@@ -103,21 +108,20 @@ class ListenerController:
             self._stop.clear()
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))      # raises if host not ownable
+            s.bind((self.host, self.port))
             s.listen(64)
             self._sock = s
             self.last_error = None
             self._thread = threading.Thread(target=self._serve_loop, args=(s,),
                                             daemon=True)
             self._thread.start()
-            print(f"[*] TCP listener on {self.host}:{self.port}")
+            print(f"[*] capture listener on {self.host}:{self.port}")
 
     def stop(self):
         with self._lock:
             self._stop.set()
             sock = self._sock
             self._sock = None
-        # Unblock the accept() call so the serve loop exits promptly, then close.
         if sock:
             try:
                 host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
@@ -135,16 +139,14 @@ class ListenerController:
             self._thread.join(timeout=1.0)
 
     def rebind(self, host, port):
-        """Stop current socket and bind a new one. On failure, restore the old."""
         old_host, old_port = self.host, self.port
         self.stop()
-        time.sleep(0.2)  # let the accept loop unwind
+        time.sleep(0.2)
         self.host, self.port = host, port
         try:
             self.start()
             return True, None
         except Exception as e:
-            # roll back so we're never left with no listener
             self.host, self.port = old_host, old_port
             self.last_error = str(e)
             try:
@@ -154,7 +156,7 @@ class ListenerController:
             return False, str(e)
 
 
-controller = ListenerController(DEFAULT_BIND, DEFAULT_PORT)
+controller = ListenerController(CAPTURE_HOST, CAPTURE_PORT)
 
 
 def _valid_port(p):
@@ -169,9 +171,14 @@ class _API(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "X-OAST-Token, Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _authed(self):
+        return self.headers.get("X-OAST-Token", "") == TOKEN
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -182,7 +189,17 @@ class _API(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "X-OAST-Token, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
+
     def do_GET(self):
+        if not self._authed():
+            self._send({"error": "unauthorized"}, 401)
+            return
         if self.path == "/notifications":
             with _lock:
                 active = [h for h in _hits if not h["cleared"]]
@@ -198,6 +215,9 @@ class _API(BaseHTTPRequestHandler):
             self._send({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._authed():
+            self._send({"error": "unauthorized"}, 401)
+            return
         if self.path == "/mark-seen":
             with _lock:
                 for h in _hits:
@@ -218,8 +238,7 @@ class _API(BaseHTTPRequestHandler):
                 return
             if host not in ALLOWED_BIND_HOSTS:
                 self._send({"ok": False,
-                            "error": f"host must be one of {sorted(ALLOWED_BIND_HOSTS)} "
-                                     f"(the box can only bind interfaces it owns)"}, 400)
+                            "error": f"host must be one of {sorted(ALLOWED_BIND_HOSTS)}"}, 400)
                 return
             if not _valid_port(port):
                 self._send({"ok": False, "error": "port out of range (1-65535)"}, 400)
@@ -240,5 +259,5 @@ def _api_server():
 
 if __name__ == "__main__":
     controller.start()
-    print(f"[*] notification API on {API_HOST}:{API_PORT}")
+    print(f"[*] notification API on {API_HOST}:{API_PORT} (token required)")
     _api_server()
