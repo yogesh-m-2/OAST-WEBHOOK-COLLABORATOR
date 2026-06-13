@@ -57,6 +57,54 @@ for _p in _extra.split(","):
 _hits = []
 _lock = threading.Lock()
 
+# ─── Correlation tokens (Burp-Collaborator style) ────────────────────────────
+# You plant a unique token in your SSRF/SQLi payload (as a subdomain, URL path,
+# or DNS name). Any captured packet whose bytes contain an active token is
+# flagged matched=True with the token id — that's your confirmed OOB callback.
+# Everything else is "noise" (scanners) and hidden by default in the UI.
+TOKENS_FILE = os.environ.get("OAST_TOKENS_FILE",
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "tokens.json"))
+_tokens = {}            # token_str -> {"label": str, "created": ts}
+_tokens_lock = threading.Lock()
+
+
+def _load_tokens():
+    global _tokens
+    try:
+        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with _tokens_lock:
+            _tokens = dict(data)
+        print(f"[*] loaded {len(_tokens)} correlation token(s)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[!] could not load tokens: {e}")
+
+
+def _save_tokens():
+    try:
+        with _tokens_lock:
+            snapshot = dict(_tokens)
+        with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+    except Exception as e:
+        print(f"[!] could not save tokens: {e}")
+
+
+def _match_token(raw_text):
+    """Return the first active token contained in the packet text, or None.
+    Case-insensitive — DNS/Host casing varies."""
+    if not raw_text:
+        return None
+    low = raw_text.lower()
+    with _tokens_lock:
+        for tok in _tokens:
+            if tok.lower() in low:
+                return tok
+    return None
+
 # ─── Live mute rules (persisted, editable from the frontend) ─────────────────
 # Stored in filter_rules.json next to this file. Three rule types you can add by
 # clicking a packet in the dashboard: source IP, destination port, protocol kind.
@@ -161,14 +209,18 @@ def _muted_by_rules(kind, src, dst):
 
 
 def _record(source_ip, source_port, raw, kind="tcp-capture", extra=None):
+    raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    matched_token = _match_token(raw_text)
     entry = {
         "id": str(uuid.uuid4()),
         "ts": time.time(),
         "source": f"{source_ip}:{source_port}",
         "ip": source_ip,
-        "raw": raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw),
+        "raw": raw_text,
         "bytes": len(raw),
         "kind": kind,
+        "matched": matched_token is not None,
+        "token": matched_token,
     }
     if extra:
         entry.update(extra)
@@ -178,7 +230,8 @@ def _record(source_ip, source_port, raw, kind="tcp-capture", extra=None):
         _hits.append(entry)
         if len(_hits) > MAX_STORED:
             del _hits[0:len(_hits) - MAX_STORED]
-    print(f"[+] {kind} from {entry['source']} ({entry['bytes']} bytes)")
+    tag = f" [MATCH:{matched_token}]" if matched_token else ""
+    print(f"[+] {kind} from {entry['source']} ({entry['bytes']} bytes){tag}")
 
 
 def _handle_conn(conn, addr):
@@ -322,10 +375,20 @@ class _API(BaseHTTPRequestHandler):
         if not self._authed():
             self._send({"error": "unauthorized"}, 401)
             return
-        if self.path == "/notifications":
+        if self.path.startswith("/notifications"):
+            only_matched = "matched=1" in self.path
             with _lock:
                 active = [h for h in _hits if not h["cleared"]]
-            self._send({"count": len(active), "items": active})
+            matched_count = sum(1 for h in active if h.get("matched"))
+            items = [h for h in active if h.get("matched")] if only_matched else active
+            self._send({"count": len(items),
+                        "matched_count": matched_count,
+                        "total_count": len(active),
+                        "items": items})
+        elif self.path == "/tokens":
+            with _tokens_lock:
+                toks = [{"token": t, **v} for t, v in _tokens.items()]
+            self._send({"tokens": toks})
         elif self.path == "/config":
             self._send({
                 "host": controller.host,
@@ -356,6 +419,30 @@ class _API(BaseHTTPRequestHandler):
             with _lock:
                 for h in _hits:
                     h["cleared"] = True
+            self._send({"ok": True})
+        elif self.path == "/tokens-add":
+            data = self._read_json()
+            tok = str(data.get("token", "")).strip()
+            label = str(data.get("label", "")).strip()
+            if not tok:
+                self._send({"ok": False, "error": "token required"}, 400)
+                return
+            with _tokens_lock:
+                _tokens[tok] = {"label": label or tok, "created": time.time()}
+            _save_tokens()
+            # retroactively re-match existing hits against the new token
+            with _lock:
+                for h in _hits:
+                    if not h.get("matched") and tok.lower() in (h.get("raw", "").lower()):
+                        h["matched"] = True
+                        h["token"] = tok
+            self._send({"ok": True, "token": tok})
+        elif self.path == "/tokens-remove":
+            data = self._read_json()
+            tok = str(data.get("token", "")).strip()
+            with _tokens_lock:
+                _tokens.pop(tok, None)
+            _save_tokens()
             self._send({"ok": True})
         elif self.path in ("/rules-add", "/rules-remove"):
             data = self._read_json()
@@ -521,6 +608,7 @@ SNIFFER_ENABLED = os.environ.get("OAST_SNIFFER", "1") != "0"
 
 if __name__ == "__main__":
     _load_rules()
+    _load_tokens()
     controller.start()
     if SNIFFER_ENABLED:
         threading.Thread(target=_sniffer, daemon=True).start()
